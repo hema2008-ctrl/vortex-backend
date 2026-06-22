@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allow Netlify frontend to call this
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)  # Allow any frontend (Netlify etc) to call this
 
 DOWNLOAD_DIR = tempfile.mkdtemp()
 MAX_AGE_SECONDS = 3600  # auto-cleanup files older than 1 hour
@@ -31,7 +31,18 @@ def health():
 
 @app.route('/download', methods=['POST'])
 def download_video():
-    """Download a YouTube (or other supported site) video using yt-dlp."""
+    """
+    Download a YouTube (or other supported site) video using yt-dlp.
+
+    NOTE: YouTube actively blocks requests coming from datacenter IPs
+    (which is what cloud hosts like Railway use) with a "Sign in to
+    confirm you're not a bot" error. We try several yt-dlp client
+    spoofing strategies in order, since different clients (android,
+    ios, web embedded) get flagged at different rates. This is the
+    same fundamental limitation every free YouTube-downloader backend
+    faces — even commercial tools rely on paid residential proxies to
+    fully solve it. This gives the best free-tier success rate.
+    """
     cleanup_old_files()
     data = request.json or {}
     url = data.get('url', '')
@@ -41,61 +52,92 @@ def download_video():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    try:
-        uid = uuid.uuid4().hex[:10]
-        out_template = os.path.join(DOWNLOAD_DIR, uid + '.%(ext)s')
+    uid = uuid.uuid4().hex[:10]
+    out_template = os.path.join(DOWNLOAD_DIR, uid + '.%(ext)s')
 
-        if audio_only:
-            cmd = [
-                'yt-dlp',
-                '--format', 'bestaudio/best',
-                '--extract-audio',
-                '--audio-format', 'mp3',
-                '--audio-quality', '0',
-                '--output', out_template,
-                '--no-playlist',
-                url
-            ]
-        else:
-            q = 'bestvideo[height<={0}]+bestaudio/best[height<={0}]'.format(quality)
-            cmd = [
-                'yt-dlp',
-                '--format', q,
-                '--merge-output-format', 'mp4',
-                '--output', out_template,
-                '--no-playlist',
-                url
-            ]
+    # Strategies tried in order, strongest-first. "--impersonate" makes yt-dlp's
+    # network requests carry a real Chrome TLS/HTTP fingerprint (via curl_cffi),
+    # which is the strongest free anti-bot bypass available — much harder for
+    # YouTube to flag than simple client spoofing alone. We layer multiple
+    # approaches because different videos/regions get flagged differently.
+    client_strategies = [
+        ['--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web,web_safari'],
+        ['--impersonate', 'chrome'],
+        ['--extractor-args', 'youtube:player_client=android'],
+        ['--extractor-args', 'youtube:player_client=ios'],
+        ['--extractor-args', 'youtube:player_client=tv_embedded'],
+        ['--extractor-args', 'youtube:player_client=web_embedded'],
+        [],  # plain default, last resort
+    ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=420)
+    last_error = ''
 
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr[-600:]}), 400
+    for strategy in client_strategies:
+        # Clean up any partial file from a previous failed attempt
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(uid):
+                try:
+                    os.remove(os.path.join(DOWNLOAD_DIR, f))
+                except Exception:
+                    pass
 
-        matches = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(uid)]
-        if not matches:
-            return jsonify({"error": "Download produced no file"}), 400
+        try:
+            if audio_only:
+                cmd = [
+                    'yt-dlp',
+                    '--format', 'bestaudio/best',
+                    '--extract-audio',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '0',
+                    '--output', out_template,
+                    '--no-playlist',
+                    '--no-check-certificate',
+                    '--socket-timeout', '30',
+                ] + strategy + [url]
+            else:
+                q = 'bestvideo[height<={0}]+bestaudio/best[height<={0}]'.format(quality)
+                cmd = [
+                    'yt-dlp',
+                    '--format', q,
+                    '--merge-output-format', 'mp4',
+                    '--output', out_template,
+                    '--no-playlist',
+                    '--no-check-certificate',
+                    '--socket-timeout', '30',
+                ] + strategy + [url]
 
-        filename = matches[0]
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-        # Get duration + basic info for the frontend (used for trim slider bounds)
-        duration = get_duration(filepath)
+            if result.returncode == 0:
+                matches = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith(uid)]
+                if matches:
+                    filename = matches[0]
+                    filepath = os.path.join(DOWNLOAD_DIR, filename)
+                    duration = get_duration(filepath)
+                    return jsonify({
+                        "success": True,
+                        "filename": filename,
+                        "duration": duration,
+                        "stream_url": "/stream/" + filename,
+                        "download_url": "/file/" + filename
+                    })
 
-        return jsonify({
-            "success": True,
-            "filename": filename,
-            "duration": duration,
-            "stream_url": "/stream/" + filename,
-            "download_url": "/file/" + filename
-        })
+            last_error = result.stderr[-500:] if result.stderr else 'Unknown yt-dlp error'
 
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Download timed out (video too large or slow connection)"}), 408
-    except FileNotFoundError:
-        return jsonify({"error": "yt-dlp not installed on server"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        except subprocess.TimeoutExpired:
+            last_error = 'Timed out (video too large or connection too slow)'
+        except FileNotFoundError:
+            return jsonify({"error": "yt-dlp not installed on server"}), 500
+        except Exception as e:
+            last_error = str(e)
+
+    # All strategies failed — YouTube is blocking this server's IP for this video.
+    is_bot_block = 'sign in' in last_error.lower() or 'bot' in last_error.lower()
+    friendly = (
+        "YOUTUBE_BLOCKED"  # special code the frontend recognises to show its own in-page fallback uploader
+    ) if is_bot_block else last_error
+
+    return jsonify({"error": friendly, "blocked": is_bot_block}), 400
 
 
 @app.route('/upload', methods=['POST'])
