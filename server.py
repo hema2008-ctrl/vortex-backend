@@ -29,6 +29,31 @@ def health():
     return jsonify({"status": "ok", "message": "VORTEX Backend running"})
 
 
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """
+    Quick diagnostic endpoint — checks that yt-dlp and ffmpeg are actually
+    installed and runnable on this server, without attempting a real
+    download. Visit this URL directly in a browser if downloads are
+    failing, to immediately see whether the issue is missing tools vs
+    a YouTube-side block.
+    """
+    info = {}
+    for tool, args in [('yt-dlp', ['yt-dlp', '--version']), ('ffmpeg', ['ffmpeg', '-version'])]:
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=15)
+            info[tool] = {
+                "installed": r.returncode == 0,
+                "version_output": (r.stdout or r.stderr).split('\n')[0][:120]
+            }
+        except FileNotFoundError:
+            info[tool] = {"installed": False, "version_output": "NOT FOUND on this server"}
+        except Exception as e:
+            info[tool] = {"installed": False, "version_output": str(e)[:120]}
+    info["download_dir_writable"] = os.access(DOWNLOAD_DIR, os.W_OK)
+    return jsonify(info)
+
+
 @app.route('/download', methods=['POST'])
 def download_video():
     """
@@ -55,18 +80,18 @@ def download_video():
     uid = uuid.uuid4().hex[:10]
     out_template = os.path.join(DOWNLOAD_DIR, uid + '.%(ext)s')
 
-    # Strategies tried in order, strongest-first. "--impersonate" makes yt-dlp's
-    # network requests carry a real Chrome TLS/HTTP fingerprint (via curl_cffi),
-    # which is the strongest free anti-bot bypass available — much harder for
-    # YouTube to flag than simple client spoofing alone. We layer multiple
-    # approaches because different videos/regions get flagged differently.
+    # Strategies tried in order. Each uses only yt-dlp's built-in client
+    # spoofing (no extra system dependencies needed), so this never crashes
+    # even on minimal hosting environments. Different clients (android, ios,
+    # embedded) get flagged by YouTube's bot-detection at different rates,
+    # so trying several in sequence gives the best realistic free-tier
+    # success rate without needing paid residential proxies.
     client_strategies = [
-        ['--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web,web_safari'],
-        ['--impersonate', 'chrome'],
         ['--extractor-args', 'youtube:player_client=android'],
         ['--extractor-args', 'youtube:player_client=ios'],
         ['--extractor-args', 'youtube:player_client=tv_embedded'],
         ['--extractor-args', 'youtube:player_client=web_embedded'],
+        ['--extractor-args', 'youtube:player_client=mweb'],
         [],  # plain default, last resort
     ]
 
